@@ -1,0 +1,146 @@
+{
+  "schema_version": 1,
+  "profile_name": "template-composite-ccid-hid-keyboard",
+  "device": {
+    "bLength": 18,
+    "bDescriptorType": 1,
+    "bcdUSB": 512,
+    "bDeviceClass": 0,
+    "bDeviceSubClass": 0,
+    "bDeviceProtocol": 0,
+    "bMaxPacketSize0": 64,
+    "idVendor": 4617,
+    "idProduct": 52254,
+    "bcdDevice": 256,
+    "iManufacturer": 1,
+    "iProduct": 2,
+    "iSerialNumber": 3,
+    "bNumConfigurations": 1
+  },
+  "strings": {
+    "1033": {
+      "1": "USB Research Lab",
+      "2": "USB CCID plus HID Keyboard Lab",
+      "3": "LAB-TEMPLATE-HID-KEYBO"
+    }
+  },
+  "configurations": [
+    {
+      "bLength": 9,
+      "bDescriptorType": 2,
+      "wTotalLength": 0,
+      "bNumInterfaces": 2,
+      "bConfigurationValue": 1,
+      "iConfiguration": 0,
+      "bmAttributes": 128,
+      "bMaxPower": 50,
+      "interfaces": [
+        {
+          "bLength": 9,
+          "bDescriptorType": 4,
+          "bInterfaceNumber": 0,
+          "bAlternateSetting": 0,
+          "bNumEndpoints": 1,
+          "bInterfaceClass": 3,
+          "bInterfaceSubClass": 1,
+          "bInterfaceProtocol": 1,
+          "iInterface": 0,
+          "extra_descriptors_hex": "092111010001223f00",
+          "endpoints": [
+            {
+              "bLength": 7,
+              "bDescriptorType": 5,
+              "bEndpointAddress": 129,
+              "bmAttributes": 3,
+              "wMaxPacketSize": 8,
+              "bInterval": 10
+            }
+          ]
+        },
+        {
+          "bLength": 9,
+          "bDescriptorType": 4,
+          "bInterfaceNumber": 1,
+          "bAlternateSetting": 0,
+          "bNumEndpoints": 3,
+          "bInterfaceClass": 11,
+          "bInterfaceSubClass": 0,
+          "bInterfaceProtocol": 0,
+          "iInterface": 0,
+          "endpoints": [
+            {
+              "bLength": 7,
+              "bDescriptorType": 5,
+              "bEndpointAddress": 131,
+              "bmAttributes": 2,
+              "wMaxPacketSize": 64,
+              "bInterval": 0
+            },
+            {
+              "bLength": 7,
+              "bDescriptorType": 5,
+              "bEndpointAddress": 3,
+              "bmAttributes": 2,
+              "wMaxPacketSize": 64,
+              "bInterval": 0
+            },
+            {
+              "bLength": 7,
+              "bDescriptorType": 5,
+              "bEndpointAddress": 132,
+              "bmAttributes": 3,
+              "wMaxPacketSize": 8,
+              "bInterval": 16
+            }
+          ],
+          "extra_descriptors_hex": "36211001000703000000a00f0000a00f0000008025000000c2010000000000000000000000000000ba0402000f010000000000000001"
+        }
+      ]
+    }
+  ],
+  "validation": {
+    "mode": "strict",
+    "calculated_fields": "auto"
+  },
+  "endpoint_io": {
+    "out_buffer_bytes": 16384,
+    "repeat_in": true,
+    "in_payloads": {
+      "129": "0000000000000000"
+    },
+    "repeat_in_addresses": [
+      129
+    ]
+  },
+  "template_info": {
+    "category": "Composite CCID plus HID keyboard",
+    "runtime_ready": true,
+    "notes": "CCID bulk transport emulator plus HID keyboard. Check UDC endpoint capacity and endpoint uniqueness."
+  },
+  "raw_descriptors": {
+    "34:0": "05010906a101050719e029e71500250175019508810295017508910195057501050819012905910295017503910195067508150025650507190029658100c0"
+  },
+  "runtime": {
+    "interfaces": [
+      {
+        "configuration_value": 1,
+        "interface_number": 0,
+        "class": "hid",
+        "boot_protocol": true,
+        "interrupt_in_endpoint": 129,
+        "control_report_hex": "0000000000000000",
+        "interrupt_in_payload_hex": "0000000000000000"
+      },
+      {
+        "configuration_value": 1,
+        "interface_number": 1,
+        "class": "ccid",
+        "in_endpoint": 131,
+        "out_endpoint": 3,
+        "atr_hex": "3B00",
+        "apdu_mode": "deterministic-lab-emulator"
+      }
+    ]
+  },
+  "control_responses": []
+}

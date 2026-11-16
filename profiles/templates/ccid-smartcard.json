@@ -1,0 +1,107 @@
+{
+  "schema_version": 1,
+  "profile_name": "template-ccid-smartcard-emulator",
+  "device": {
+    "bLength": 18,
+    "bDescriptorType": 1,
+    "bcdUSB": 512,
+    "bDeviceClass": 0,
+    "bDeviceSubClass": 0,
+    "bDeviceProtocol": 0,
+    "bMaxPacketSize0": 64,
+    "idVendor": 4617,
+    "idProduct": 52253,
+    "bcdDevice": 256,
+    "iManufacturer": 1,
+    "iProduct": 2,
+    "iSerialNumber": 3,
+    "bNumConfigurations": 1
+  },
+  "strings": {
+    "1033": {
+      "1": "USB Research Lab",
+      "2": "USB CCID Smart Card Lab Emulator",
+      "3": "LAB-CCID-0001"
+    }
+  },
+  "configurations": [
+    {
+      "bLength": 9,
+      "bDescriptorType": 2,
+      "wTotalLength": 0,
+      "bNumInterfaces": 1,
+      "bConfigurationValue": 1,
+      "iConfiguration": 0,
+      "bmAttributes": 128,
+      "bMaxPower": 50,
+      "interfaces": [
+        {
+          "bLength": 9,
+          "bDescriptorType": 4,
+          "bInterfaceNumber": 0,
+          "bAlternateSetting": 0,
+          "bNumEndpoints": 3,
+          "bInterfaceClass": 11,
+          "bInterfaceSubClass": 0,
+          "bInterfaceProtocol": 0,
+          "iInterface": 0,
+          "endpoints": [
+            {
+              "bLength": 7,
+              "bDescriptorType": 5,
+              "bEndpointAddress": 129,
+              "bmAttributes": 2,
+              "wMaxPacketSize": 64,
+              "bInterval": 0
+            },
+            {
+              "bLength": 7,
+              "bDescriptorType": 5,
+              "bEndpointAddress": 1,
+              "bmAttributes": 2,
+              "wMaxPacketSize": 64,
+              "bInterval": 0
+            },
+            {
+              "bLength": 7,
+              "bDescriptorType": 5,
+              "bEndpointAddress": 130,
+              "bmAttributes": 3,
+              "wMaxPacketSize": 8,
+              "bInterval": 16
+            }
+          ],
+          "extra_descriptors_hex": "36211001000703000000a00f0000a00f0000008025000000c2010000000000000000000000000000ba0402000f010000000000000001"
+        }
+      ]
+    }
+  ],
+  "validation": {
+    "mode": "strict",
+    "calculated_fields": "auto"
+  },
+  "endpoint_io": {
+    "out_buffer_bytes": 16384,
+    "repeat_in": false,
+    "in_payloads": {}
+  },
+  "template_info": {
+    "category": "USB CCID smart-card interface",
+    "runtime_ready": true,
+    "notes": "CCID bulk transport emulator with common command framing and deterministic APDU replies. Not a physical smart card or complete T=0/T=1 implementation."
+  },
+  "runtime": {
+    "interfaces": [
+      {
+        "configuration_value": 1,
+        "interface_number": 0,
+        "class": "ccid",
+        "in_endpoint": 129,
+        "out_endpoint": 1,
+        "atr_hex": "3B00",
+        "apdu_mode": "deterministic-lab-emulator"
+      }
+    ]
+  },
+  "control_responses": []
+}
