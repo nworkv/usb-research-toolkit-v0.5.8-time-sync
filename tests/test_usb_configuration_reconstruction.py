@@ -40,6 +40,26 @@ def main():
     html = REPORTER.configuration_comparison_html(result)
     assert "EXPECTED VID/PID" in html and "HOST RECEIVED VID/PID" in html
     assert "NOT_REQUESTED" in html
+
+    # Full-PCAP inventory is deliberately independent of per-case time windows.
+    # These six early enumeration transactions must remain visible even when they
+    # precede the first fuzz case.
+    early_groups = []
+    for frame, payload in enumerate((device, config, hid_report, device, config, hid_report), 1):
+        dtype = payload[1] if len(payload) > 1 else 1
+        early_groups.append({
+            "request": {"bmRequestType": 0x80, "bRequest": 6, "wValue": dtype << 8,
+                        "wIndex": 0, "wLength": len(payload)},
+            "payload": payload, "frame_numbers": [frame], "time_epoch": 100.0 + frame,
+            "bus_id": 1, "device_address": 4, "urb_id": str(frame),
+            "status": "COMPLETED", "complete_seen": True,
+        })
+    inventory = REPORTER.build_host_capture_inventory(early_groups)
+    assert inventory["get_descriptor_count"] == 6
+    assert inventory["devices"][0]["vid_pid"] == {"vid": "0x1234", "pid": "0x5678"}
+    assert inventory["devices"][0]["transactions"][0]["frames"] == [1]
+    inventory_html = REPORTER.host_inventory_html(inventory)
+    assert "Frame" in inventory_html and "12010002" in inventory_html
     # A changed endpoint/config byte must be reported as a difference.
     changed = bytearray(config)
     changed[8] = 0x40

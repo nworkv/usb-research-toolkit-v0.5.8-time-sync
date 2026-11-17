@@ -1,0 +1,7 @@
+USB LAB — TARGET OS TIME SYNCHRONIZATION
+Target: nworkv@10.10.10.218 (linux)
+Mode: check
+Status: ERROR
+Error: nworkv@10.10.10.218: Permission denied (publickey,password).
+
+See time-sync.json for UTC timestamps and full details.

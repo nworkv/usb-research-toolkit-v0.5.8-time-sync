@@ -1,0 +1,12 @@
+{
+  "tool": "usb-time-sync",
+  "target": "nworkv@10.10.10.218",
+  "target_os": "linux",
+  "mode": "check",
+  "started_utc": "2026-11-17T10:36:04.249100+00:00",
+  "source": "local system UTC clock",
+  "warning": "Clock changes can affect logs, certificates, scheduled jobs and time-sensitive services.",
+  "status": "ERROR",
+  "error": "nworkv@10.10.10.218: Permission denied (publickey,password).",
+  "finished_utc": "2026-11-17T10:36:04.405657+00:00"
+}

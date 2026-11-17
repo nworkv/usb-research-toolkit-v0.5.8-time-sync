@@ -829,3 +829,29 @@ python3 scripts/usb-time-sync.py \\
 На Windows SSH-сеанс должен иметь права администратора, иначе `Set-Date` завершится ошибкой. Для Linux требуется `sudo -n date`; утилита намеренно не запрашивает и не передаёт пароль через SSH. Перед `--sync` проверь адрес и учётную запись: изменение системных часов влияет на журналы, сертификаты, планировщик и времязависимые службы. Для постоянной синхронизации предпочтительнее настроить NTP/chrony/Windows Time; эта утилита предназначена для разовой лабораторной выверки перед кампанией.
 
 `target_minus_source_ms` показывает смещение целевой системы относительно локального источника: положительное значение означает, что часы цели идут впереди. В режиме `--check` по умолчанию PASS означает абсолютное расхождение не более 2000 мс; порог можно изменить через `--max-drift-ms`. После `--sync` утилита повторно измеряет смещение и записывает оба результата. Время устанавливается по UTC, поэтому часовой пояс отображения не меняется.
+
+## Full USBPcap enumeration inventory (updated report)
+
+`report-usb-campaign.py` now builds a capture-wide USB enumeration inventory before
+assigning traffic to fuzz cases. This inventory is independent of case timestamps and
+therefore includes descriptor requests observed before the first fuzz mutation (for
+example, the initial Windows enumeration packets). It groups observations by USB bus
+and device address, retains each GET_DESCRIPTOR setup tuple, frame numbers, URB status,
+actual USBPcap payload bytes (HEX), and decoded descriptor fields. The report shows
+this inventory first; per-case Expected / Raw Gadget trace / USBPcap comparison remains
+separate. Missing payload is explicitly shown as `NO DATA` and is never substituted
+with profile bytes.
+
+Generate the report as before:
+
+```bash
+python3 scripts/report-usb-campaign.py \
+  --campaign-dir runs/fuzz/<campaign-directory> \
+  --host-pcap /path/to/campaign.pcapng \
+  --time-tolerance 0.75
+```
+
+The capture-wide inventory is available in `protocol-report.html`, `protocol-report.txt`
+and JSON under `host_capture_inventory`. USBPcap remains a Windows host-stack capture,
+not an electrical USB analyzer. A successful enumeration inventory means only that
+these transactions and payloads were present in the supplied capture.

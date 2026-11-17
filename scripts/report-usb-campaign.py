@@ -1068,6 +1068,82 @@ def configuration_comparison_html(data: dict[str, Any]) -> str:
     header = f'<div class="id-grid"><div><b>EXPECTED VID/PID</b><p>VID {html.escape(str(ids.get("vid") or "N/A"))} · PID {html.escape(str(ids.get("pid") or "N/A"))}</p></div><div><b>HOST RECEIVED VID/PID</b><p>VID {html.escape(str(host_ids.get("vid") or "NOT RECEIVED"))} · PID {html.escape(str(host_ids.get("pid") or "NOT RECEIVED"))}</p></div></div>'
     return header + f'<p>USBPcap восстановил {data.get("observed_descriptor_count", 0)} типов/вариантов дескрипторов; не запрошено: {data.get("not_requested_count", 0)}; частично/без payload: {data.get("partial_count", 0)}; отличий: {data.get("different_count", 0)}.</p>' + ''.join(rows)
 
+
+def build_host_capture_inventory(host_groups: list[dict[str, Any]]) -> dict[str, Any]:
+    """Reconstruct USB enumeration from the complete PCAP, independent of fuzz-case windows.
+
+    Keeps device identity (bus/address), every observed GET_DESCRIPTOR transaction,
+    setup packet, frame numbers, URB completion state and the actual captured payload.
+    This intentionally includes traffic before the first fuzz case.
+    """
+    devices: dict[tuple[Any, Any], list[dict[str, Any]]] = defaultdict(list)
+    control_events = []
+    for g in host_groups:
+        req = g.get("request")
+        if not isinstance(req, dict):
+            continue
+        bm = int(req.get("bmRequestType") or 0)
+        br = int(req.get("bRequest") if req.get("bRequest") is not None else -1)
+        wv = int(req.get("wValue") or 0)
+        wi = int(req.get("wIndex") or 0)
+        wl = int(req.get("wLength") or 0)
+        event = {"frames": g.get("frame_numbers", []), "time_epoch": g.get("time_epoch"),
+                 "bus_id": g.get("bus_id"), "device_address": g.get("device_address"),
+                 "urb_id": g.get("urb_id"), "urb_status": g.get("status"),
+                 "complete_seen": g.get("complete_seen", False),
+                 "setup": {"bmRequestType": bm, "bRequest": br, "wValue": wv, "wIndex": wi, "wLength": wl},
+                 "payload_hex": g.get("payload").hex() if g.get("payload") is not None else None}
+        control_events.append(event)
+        if br == 6 and (bm & 0x80):
+            dtype, index = (wv >> 8) & 0xff, wv & 0xff
+            lang = wi if dtype == 3 and index else 0
+            iface = wi if dtype == 0x22 else None
+            key = (dtype, index, lang, iface)
+            devices[(g.get("bus_id"), g.get("device_address"))].append({
+                **event, "key": list(key), "descriptor_type": dtype,
+                "descriptor_name": descriptor_name(dtype, index, lang, iface),
+                "requested_length": wl, "actual_length": len(g["payload"]) if g.get("payload") is not None else None,
+                "actual_hex": event["payload_hex"],
+                "decoded": describe_descriptor(dtype, g["payload"]) if g.get("payload") is not None else []})
+    output_devices=[]
+    for (bus, address), txs in sorted(devices.items(), key=lambda x: (str(x[0][0]), str(x[0][1]))):
+        best={}
+        for tx in txs:
+            key=tuple(tx["key"])
+            old=best.get(key)
+            score=(tx["urb_status"] in ("COMPLETED", "COMPLETION_FRAME_OBSERVED"), tx["actual_length"] or 0)
+            old_score=((old["urb_status"] in ("COMPLETED", "COMPLETION_FRAME_OBSERVED")), old["actual_length"] or 0) if old else None
+            if old is None or score>old_score: best[key]=tx
+        dev=best.get((1,0,0,None))
+        cfgs=[x for k,x in best.items() if k[0]==2]
+        output_devices.append({"bus_id":bus,"device_address":address,
+          "vid_pid":decode_device_ids(bytes.fromhex(dev["actual_hex"]) if dev and dev.get("actual_hex") else None),
+          "descriptor_count":len(best), "transactions":txs,
+          "descriptors":[best[k] for k in sorted(best)],
+          "configurations":[{"name":x["descriptor_name"],"hex":x["actual_hex"],"decoded":x["decoded"],
+             "length":x["actual_length"],"declared_total_length":(bytes.fromhex(x["actual_hex"])[2] | bytes.fromhex(x["actual_hex"])[3]<<8) if x.get("actual_hex") and len(bytes.fromhex(x["actual_hex"]))>=4 else None} for x in cfgs]})
+    return {"source":"complete USBPcap capture (not split by fuzz-case timestamps)",
+            "control_transfer_count":len(control_events),"get_descriptor_count":sum(len(v) for v in devices.values()),
+            "devices":output_devices,"control_events":control_events}
+
+
+def host_inventory_html(inventory: dict[str, Any]) -> str:
+    out=[f'<p><b>Полный захват:</b> control transfers={inventory["control_transfer_count"]}; GET_DESCRIPTOR={inventory["get_descriptor_count"]}. Включены пакеты до начала фаззинга.</p>']
+    for dev in inventory.get("devices",[]):
+        ids=dev.get("vid_pid",{})
+        out.append(f'<h3>USB bus {html.escape(str(dev.get("bus_id")))} / address {html.escape(str(dev.get("device_address")))} — VID {html.escape(str(ids.get("vid") or "unknown"))} PID {html.escape(str(ids.get("pid") or "unknown"))}</h3>')
+        out.append('<table><thead><tr><th>Frame</th><th>Descriptor</th><th>Setup (bmReq, bReq, wValue, wIndex, wLength)</th><th>Status</th><th>HEX получено из USBPcap</th></tr></thead><tbody>')
+        for tx in dev.get("transactions",[]):
+            q=tx["setup"]; setup=' '.join(f'{q[k]:04X}' for k in ("bmRequestType","bRequest","wValue","wIndex","wLength"))
+            hx=tx.get("actual_hex") or "NO DATA"
+            out.append(f'<tr><td>{html.escape(str(tx.get("frames")))}</td><td>{html.escape(tx["descriptor_name"])}</td><td><code>{setup}</code></td><td>{html.escape(str(tx.get("urb_status")))}</td><td><code>{html.escape(hx.upper())}</code></td></tr>')
+        out.append('</tbody></table>')
+        for d in dev.get("descriptors",[]):
+            out.append(f'<details><summary>{html.escape(d["descriptor_name"])} — {d.get("actual_length")} bytes</summary><pre>{html.escape((d.get("actual_hex") or "NO DATA").upper())}</pre><ul>'+''.join(f'<li>{html.escape(x)}</li>' for x in d.get("decoded",[]))+'</ul></details>')
+    if not inventory.get("devices"):
+        out.append('<p class="missing">В захвате не восстановлено ни одного GET_DESCRIPTOR. Проверь USBPcap Root Hub и наличие completion/data stage.</p>')
+    return ''.join(out)
+
 def render_case(row: dict[str, Any], profile_path: Path, trace_path: Path | None,
                 profile: dict[str, Any] | None, device_events: list[dict[str, Any]],
                 host_groups: list[dict[str, Any]], verifier: Any,
@@ -1296,6 +1372,13 @@ def build_txt(report: dict[str, Any]) -> str:
     lines = ["USB CAMPAIGN — ПОБАЙТОВЫЙ ОТЧЁТ", "=" * 96,
              f"Кампания: {report['campaign_dir']}", f"PCAP/PCAPNG: {report['host_pcap']}",
              f"Всего случаев: {len(report['cases'])}", "", "СВОДКА СТАТУСОВ:"]
+    inv = report.get("host_capture_inventory", {})
+    lines.extend(["", "ПОЛНАЯ USB ENUMERATION ИЗ USBPcap (включая трафик до фаззинга)", f"Control transfers: {inv.get('control_transfer_count', 0)}; GET_DESCRIPTOR: {inv.get('get_descriptor_count', 0)}"])
+    for dev in inv.get("devices", []):
+        ids = dev.get("vid_pid", {})
+        lines.append(f"USB bus={dev.get('bus_id')} address={dev.get('device_address')} VID={ids.get('vid')} PID={ids.get('pid')}")
+        for tx in dev.get("transactions", []):
+            lines.append(f"  frame={tx.get('frames')} {tx.get('descriptor_name')} status={tx.get('urb_status')} HEX={tx.get('actual_hex') or 'NO DATA'}")
     for status, count in sorted(report["status_counts"].items()):
         lines.append(f"  {status}: {count}")
     lines.extend(["", "ВАЖНО: хостовый захват сопоставляется со случаем по времени. Часы Windows и Pi должны быть синхронизированы.",
@@ -1413,7 +1496,7 @@ def descriptor_html(t: dict[str, Any], index: int) -> str:
     device_panel = f'''<section class="pane sent"><h4>ОТПРАВЛЕНО — RAW GADGET TRACE</h4><p>Длина: {t.get('device_trace_length')}; статус: {html.escape(str(t.get('device_trace_status')))}; trace seq: {html.escape(str(t.get('device_trace_response_sequence')))}</p>{html_byte_dump(device, expected)}<p class="muted">Payload, переданный в EP0_WRITE и записанный trace; это не электрическое измерение шины.</p></section>'''
     host_panel = f'''<section class="pane observed"><h4>ПОЛУЧЕНО — WINDOWS USBPcap</h4><p>Длина: {t.get('actual_length')}; состояние URB: {html.escape(str(t.get('host_transfer_status')))}; frames: {html.escape(str(t.get('frames')))}</p>{html_byte_dump(actual, device if device is not None else expected)}<h5>Расшифровка</h5>{fields(t.get('actual_decoded',[]))}</section>'''
     byte_table = t.get("three_way_byte_table") or t.get("byte_table", "")
-    return f'''<details class="descriptor" open>
+    return f'''<details class="descriptor">
 <summary><b>GET_DESCRIPTOR #{index}: {html.escape(t['descriptor_name'])}</b><span class="pill {status_class}">{html.escape(result)}</span><span class="muted">frames {html.escape(str(t['frames']))}; host address {html.escape(str(t.get('device_address')))}</span></summary>
 <div class="comparegrid threeway">{expected_panel}{device_panel}{host_panel}</div>
 <div class="diffline"><b>Сравнение:</b> expected → trace: {html.escape(str(t.get('expected_vs_device', {}).get('status', 'UNKNOWN')))}; trace → USBPcap: {html.escape(str(t.get('device_vs_host', {}).get('status', 'UNKNOWN')))}; общий статус: {html.escape(result)}.</div>
@@ -1453,7 +1536,7 @@ body{{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;background:var(
 <h1>USB Research Toolkit — побайтовый отчёт кампании</h1><p class="meta">Кампания: {html.escape(report['campaign_dir'])}<br>PCAPNG: {html.escape(report['host_pcap'])}<br>Generated: {html.escape(report['created_utc'])}</p>
 <div class="note">Три источника: ожидаемые байты JSON-профиля; payload, записанный Raw Gadget при EP0_WRITE/endpoint I/O; данные, извлечённые TShark из USBPcap. Это наблюдение на уровне host stack, не подтверждение электрических USB-пакетов. Обработка привязана ко времени записи кампании; при несинхронизированных часах сопоставление может быть неверным.</div>
 <div class="summary">{counts}</div>
-<h2>Случаи</h2>{''.join(cards)}
+<h2>USB-конфигурация, восстановленная из ВСЕГО USBPcap</h2><p class="note">Этот раздел анализирует весь захват независимо от временных окон фаззинг-case. Поэтому в него входят и начальные пакеты enumeration, записанные до первой мутации.</p>{host_inventory_html(report.get('host_capture_inventory', {}))}<h2>Случаи фаззинга и сопоставление</h2>{''.join(cards)}
 </body></html>'''
 
 
@@ -1490,7 +1573,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Читаю PCAPNG через tshark: {pcap}", flush=True)
     host_rows, fields = read_tshark_rows(pcap, args.tshark)
     host_groups = build_transfer_groups(host_rows)
+    host_inventory = build_host_capture_inventory(host_groups)
     print(f"Host frames: {len(host_rows)}; USB transfer groups: {len(host_groups)}; fields: {len(fields)}", flush=True)
+    print(f"Полный PCAP inventory: {host_inventory['get_descriptor_count']} GET_DESCRIPTOR до/во время/после кампании", flush=True)
     verifier = import_verifier()
     cases = []
     for row in sorted(rows, key=lambda x: int(x.get("case", 0))):
@@ -1534,7 +1619,7 @@ def main(argv: list[str] | None = None) -> int:
               "campaign_dir": str(campaign_dir), "host_pcap": str(pcap), "tshark_fields": fields,
               "time_tolerance_seconds": args.time_tolerance, "host_clock_offset_seconds": args.host_clock_offset_seconds,
               "host_frame_count": len(host_rows), "host_transfer_group_count": len(host_groups),
-              "status_counts": status_counts, "cases": cases,
+              "status_counts": status_counts, "host_capture_inventory": host_inventory, "cases": cases,
               "limitations": [
                   "USBPcap records Windows USB host-stack/URB observations; it is not an electrical USB analyzer.",
                   "The single capture is split by campaign timestamps. Synchronize clocks; unrelated traffic on the same captured USB bus may still appear in a case window.",
