@@ -832,15 +832,23 @@ python3 scripts/usb-time-sync.py \\
 
 ## Full USBPcap enumeration inventory (updated report)
 
-`report-usb-campaign.py` now builds a capture-wide USB enumeration inventory before
+`report-usb-campaign.py` builds a capture-wide USB enumeration inventory before
 assigning traffic to fuzz cases. This inventory is independent of case timestamps and
-therefore includes descriptor requests observed before the first fuzz mutation (for
-example, the initial Windows enumeration packets). It groups observations by USB bus
-and device address, retains each GET_DESCRIPTOR setup tuple, frame numbers, URB status,
-actual USBPcap payload bytes (HEX), and decoded descriptor fields. The report shows
-this inventory first; per-case Expected / Raw Gadget trace / USBPcap comparison remains
-separate. Missing payload is explicitly shown as `NO DATA` and is never substituted
-with profile bytes.
+includes descriptor requests observed before the first fuzz mutation.
+
+For Windows USBPcap, request and completion frames are correlated by `IRP ID`, with
+`URB Function` and `Control transfer stage` identifying SETUP and COMPLETE. The parser
+does not depend on `usb.urb_id` or `usb.urb_type` being populated. The inventory retains
+the exact 8-byte SETUP packet HEX, setup parameters, request/response frame numbers,
+completion status, requested/received lengths, actual response HEX, and decoded
+descriptor fields. Missing response data is never replaced with expected profile bytes.
+It distinguishes missing completion, STALL, TIMEOUT, CANCELLED and generic errors.
+
+A successful USB transfer is not proof that the descriptor is valid. The report also
+flags malformed descriptor lengths and interface numbers outside `bNumInterfaces`.
+Per-case Expected / Raw Gadget trace / USBPcap comparison remains separate from the
+capture-wide inventory. USBPcap is a Windows host-stack capture, not an electrical
+USB analyzer.
 
 Generate the report as before:
 

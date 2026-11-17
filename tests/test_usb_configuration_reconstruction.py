@@ -60,11 +60,30 @@ def main():
     assert inventory["devices"][0]["transactions"][0]["frames"] == [1]
     inventory_html = REPORTER.host_inventory_html(inventory)
     assert "Frame" in inventory_html and "12010002" in inventory_html
+    assert "Request HEX" in inventory_html and "8006000100001200" in inventory_html
+
+    # USBPcap setup requests with no completion must never be reported as a response.
+    missing = REPORTER.build_transfer_groups([{
+        "frame_number": 99, "time_epoch": 101.0, "bus_id": 1, "device_address": 1,
+        "irp_id": "0xabc", "urb_function": "URB_FUNCTION_GET_DESCRIPTOR_FROM_DEVICE",
+        "control_stage": "0", "request": {"bmRequestType": 128, "bRequest": 6,
+        "wValue": 0x0100, "wIndex": 0, "wLength": 18}, "urb_status": None,
+        "get_descriptor_response": None, "control_response": None,
+        "data_fragment": None, "capdata": None
+    }])
+    assert len(missing) == 1 and missing[0]["status"] == "NO_COMPLETION"
+    assert missing[0]["payload"] is None
     # A changed endpoint/config byte must be reported as a difference.
     changed = bytearray(config)
     changed[8] = 0x40
     changed_result = REPORTER.reconstruct_host_configuration([tx(2, 0, bytes(changed))], catalogue[1:2])
     assert changed_result["different_count"] == 1
+    malformed_iface = bytes.fromhex("09 02 22 00 01 01 00 80 19 09 04 99 00 01 03 00 00 00 09 21 11 01 00 01 22 3e 00 07 05 81 03 04 00 0a")
+    decoded = REPORTER.describe_descriptor(2, malformed_iface)
+    assert any("bInterfaceNumber=153" in line and "INVALID" in line for line in decoded), decoded
+    short_iface = bytes.fromhex("09 02 11 00 01 01 00 80 19 08 04 00 00 01 03 00 00")
+    decoded_short = REPORTER.describe_descriptor(2, short_iface)
+    assert any("Interface descriptor" in line and "requires 9 bytes" in line for line in decoded_short), decoded_short
     print("test_usb_configuration_reconstruction: PASS")
 
 

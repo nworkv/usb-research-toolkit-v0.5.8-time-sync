@@ -1,3 +1,14 @@
+# Изменения
+
+## Исправление анализа Windows USBPcap
+
+- Запрос SETUP и ответ COMPLETE связываются по `IRP ID`; `URB Function` и `usb.control_stage` определяют стадии транзакции.
+- Добавлено извлечение `usb.irp_id`, `usb.urb_function`, `usb.control_stage`, `usb.data_fragment` и фактических полей ответа дескриптора.
+- Полный инвентарь показывает HEX 8-байтового SETUP, HEX ответа, номера кадров, запрошенную и полученную длину, статус завершения.
+- Отсутствие completion не считается успешным ответом; отдельно отмечаются STALL, TIMEOUT, CANCELLED и NO_COMPLETION.
+- Проверка Configuration descriptor обнаруживает короткий Interface descriptor и номер интерфейса вне `bNumInterfaces`.
+- Добавлены регрессионные тесты для USBPcap IRP-корреляции и отсутствующего completion.
+
 # Журнал изменений
 
 ## v0.5.8 — полное восстановление конфигурации по USBPcap

@@ -30,10 +30,13 @@ FIELD_CANDIDATES: dict[str, tuple[str, ...]] = {
     "bus_id": ("usb.bus_id",),
     "device_address": ("usb.device_address",),
     "urb_id": ("usb.urb_id",),
+    "irp_id": ("usb.irp_id",),
     "urb_type": ("usb.urb_type",),
+    "urb_function": ("usb.urb_function",),
+    "control_stage": ("usb.control_stage",),
     "endpoint_address": ("usb.endpoint_address",),
     "transfer_type": ("usb.transfer_type",),
-    "urb_status": ("usb.urb_status", "usb.usbd_status"),
+    "urb_status": ("usb.usbd_status", "usb.irp_usbd_status", "usb.urb_status"),
     "request_type": ("usb.bmRequestType", "usb.setup.bmRequestType"),
     "bRequest": ("usb.setup.bRequest",),
     "wValue": ("usb.setup.wValue",),
@@ -41,6 +44,7 @@ FIELD_CANDIDATES: dict[str, tuple[str, ...]] = {
     "wLength": ("usb.setup.wLength",),
     "data_len": ("usb.data_len",),
     "capdata": ("usb.capdata",),
+    "data_fragment": ("usb.data_fragment",),
     "control_response": ("usb.control.Response",),
     "get_descriptor_response": ("usb.getDescriptor.Response",),
     "idVendor": ("usb.idVendor",),
@@ -214,16 +218,16 @@ def normalize_field_row(raw: dict[str, str], mapping: dict[str, str]) -> dict[st
     out: dict[str, Any] = {}
     for logical, field in mapping.items():
         value = (raw.get(field) or "").strip()
-        if logical in ("capdata", "control_response", "get_descriptor_response"):
+        if logical in ("capdata", "data_fragment", "control_response", "get_descriptor_response"):
             out[logical] = value or None
         elif logical == "time_epoch":
             try:
                 out[logical] = float(value) if value else None
             except ValueError:
                 out[logical] = None
-        elif logical in ("urb_id",):
+        elif logical in ("urb_id", "irp_id"):
             out[logical] = value or None
-        elif logical in ("urb_type", "transfer_type", "urb_status"):
+        elif logical in ("urb_type", "urb_function", "control_stage", "transfer_type", "urb_status"):
             out[logical] = value or None
         elif logical == "bRequest":
             out[logical] = parse_request_code(value)
@@ -272,7 +276,7 @@ def urb_class(value: Any) -> str:
 
 
 def build_transfer_groups(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Pair USBPcap URB submit/completion rows while respecting reused URB IDs."""
+    """Pair USBPcap IRPs by IRP ID and control stage; retain legacy URB pairing."""
     groups: list[dict[str, Any]] = []
     pending: dict[tuple[str, str], deque[dict[str, Any]]] = defaultdict(deque)
 
@@ -280,20 +284,55 @@ def build_transfer_groups(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         g = {"rows": [row], "request": row.get("request"), "first_time": row.get("time_epoch"),
              "last_time": row.get("time_epoch"), "frame_numbers": [row.get("frame_number")],
              "bus_id": row.get("bus_id"), "device_address": row.get("device_address"),
-             "urb_id": row.get("urb_id"), "urb_types": [urb_class(row.get("urb_type"))]}
+             "urb_id": row.get("irp_id") or row.get("urb_id"), "irp_id": row.get("irp_id"),
+             "urb_types": [urb_class(row.get("urb_type"))],
+             "urb_functions": [row.get("urb_function")],
+             "control_stages": [row.get("control_stage")]}
         groups.append(g)
         return g
 
     for row in rows:
+        irp = row.get("irp_id")
+        stage = parse_int(row.get("control_stage"))
+        fn = str(row.get("urb_function") or "").upper()
+        is_setup = row.get("request") is not None and (stage == 0 or "GET_DESCRIPTOR_FROM_DEVICE" in fn)
+        is_complete = stage == 3 or ("CONTROL_TRANSFER" in fn and row.get("request") is None)
+        if irp:
+            key = (str(row.get("bus_id") or "?"), str(irp))
+            if is_setup:
+                pending[key].append(make_group(row))
+                continue
+            if is_complete:
+                queue = pending.get(key)
+                if queue:
+                    g = queue.popleft()
+                    if not queue:
+                        pending.pop(key, None)
+                    g["rows"].append(row)
+                    g["last_time"] = row.get("time_epoch")
+                    g["frame_numbers"].append(row.get("frame_number"))
+                    g["control_stages"].append(row.get("control_stage"))
+                    g["urb_functions"].append(row.get("urb_function"))
+                    continue
+                make_group(row)
+                continue
+            if pending.get(key):
+                g = pending[key][-1]
+                g["rows"].append(row)
+                g["last_time"] = row.get("time_epoch")
+                g["frame_numbers"].append(row.get("frame_number"))
+                continue
+            make_group(row)
+            continue
+
+        # Compatibility with captures exposing usb.urb_id + usb.urb_type.
         urbid = row.get("urb_id")
         bus = str(row.get("bus_id") if row.get("bus_id") is not None else "?")
         key = (bus, str(urbid)) if urbid else None
         typ = urb_class(row.get("urb_type"))
         if key and typ == "S":
-            g = make_group(row)
-            pending[key].append(g)
-            continue
-        if key and typ in {"C", "E"}:
+            pending[key].append(make_group(row))
+        elif key and typ in {"C", "E"}:
             queue = pending.get(key)
             if queue:
                 g = queue.popleft()
@@ -303,31 +342,28 @@ def build_transfer_groups(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 g["last_time"] = row.get("time_epoch")
                 g["frame_numbers"].append(row.get("frame_number"))
                 g["urb_types"].append(typ)
-                if g.get("request") is None and row.get("request") is not None:
-                    g["request"] = row.get("request")
-                if g.get("device_address") is None:
-                    g["device_address"] = row.get("device_address")
-                continue
-            make_group(row)
-            continue
-        if key and pending.get(key):
+            else:
+                make_group(row)
+        elif key and pending.get(key):
             g = pending[key][-1]
             g["rows"].append(row)
             g["last_time"] = row.get("time_epoch")
             g["frame_numbers"].append(row.get("frame_number"))
             g["urb_types"].append(typ)
-            if g.get("request") is None and row.get("request") is not None:
-                g["request"] = row.get("request")
-            continue
-        make_group(row)
+        else:
+            make_group(row)
+
     for g in groups:
         if g.get("request") is None:
             g["request"] = next((x.get("request") for x in g["rows"] if x.get("request") is not None), None)
         g["time_epoch"] = next((x.get("time_epoch") for x in g["rows"] if x.get("request") is not None and x.get("time_epoch") is not None), g.get("first_time"))
         g["payload"] = choose_payload(g["rows"])
         g["status"] = transfer_status(g["rows"])
-        g["complete_seen"] = "C" in g.get("urb_types", [])
-        g["is_urb_error"] = "E" in g.get("urb_types", [])
+        g["complete_seen"] = ("C" in g.get("urb_types", [])) or any(
+            parse_int(x.get("control_stage")) == 3 or "CONTROL_TRANSFER" in str(x.get("urb_function") or "").upper()
+            for x in g["rows"])
+        g["is_urb_error"] = ("E" in g.get("urb_types", [])) or any(
+            "ERROR" in str(x.get("urb_function") or "").upper() for x in g["rows"])
         g["frame_numbers"] = sorted({n for n in g.get("frame_numbers", []) if n is not None})
     groups.sort(key=lambda g: (g.get("time_epoch") if g.get("time_epoch") is not None else -1, g["frame_numbers"][0] if g["frame_numbers"] else -1))
     return groups
@@ -336,7 +372,7 @@ def build_transfer_groups(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def choose_payload(rows: list[dict[str, Any]]) -> bytes | None:
     candidates: list[tuple[int, int, bytes]] = []
     for row in rows:
-        for rank, key in enumerate(("get_descriptor_response", "control_response", "capdata")):
+        for rank, key in enumerate(("get_descriptor_response", "control_response", "data_fragment", "capdata")):
             value = row.get(key)
             parsed = parse_hex_field(value)
             if parsed is not None:
@@ -357,16 +393,26 @@ def transfer_status(rows: list[dict[str, Any]]) -> str:
             continue
         saw_status = True
         n = parse_int(raw)
+        low = str(raw).lower()
+        if "stall" in low:
+            return "STALL"
+        if "timeout" in low or "timed out" in low:
+            return "TIMEOUT"
+        if "cancelled" in low or "canceled" in low:
+            return "CANCELLED"
         if n is not None and n != 0:
             return "ERROR"
-        low = str(raw).lower()
-        if any(s in low for s in ("stall", "error", "timeout", "failed", "cancelled", "canceled")):
+        if any(s in low for s in ("error", "failed")):
             return "ERROR"
     if any(urb_class(r.get("urb_type")) == "E" for r in rows):
         return "ERROR"
-    if any(urb_class(r.get("urb_type")) == "C" for r in rows):
+    has_completion = any(urb_class(r.get("urb_type")) == "C" or
+                         parse_int(r.get("control_stage")) == 3 or
+                         "CONTROL_TRANSFER" in str(r.get("urb_function") or "").upper()
+                         for r in rows)
+    if has_completion:
         return "COMPLETED" if saw_status else "COMPLETION_FRAME_OBSERVED"
-    return "SUBMITTED_ONLY"
+    return "NO_COMPLETION"
 
 
 def descriptor_name(dtype: int, index: int, lang: int = 0, iface: int | None = None) -> str:
@@ -460,11 +506,16 @@ def describe_descriptor(dtype: int, data: bytes) -> list[str]:
                       f"idProduct=0x{pid:04x}", f"bcdDevice=0x{bcddev:04x}",
                       f"iManufacturer={data[14]}", f"iProduct={data[15]}", f"iSerialNumber={data[16]}",
                       f"bNumConfigurations={data[17]}"])
+        if data[0] != 18:
+            lines.append(f"INVALID: Device descriptor bLength={data[0]}, expected 18")
     elif dtype == 2 and len(data) >= 9:
         total = data[2] | data[3] << 8
         lines.extend([f"wTotalLength={total} (0x{total:04x})", f"bNumInterfaces={data[4]}",
                       f"bConfigurationValue={data[5]}", f"iConfiguration={data[6]}",
                       f"bmAttributes=0x{data[7]:02x}", f"bMaxPower={data[8]} (2 mA units for USB 2.0)"])
+        if total != len(data):
+            relation = "short" if len(data) < total else "long"
+            lines.append(f"INVALID/INCOMPLETE: captured Configuration bytes={len(data)}, wTotalLength={total} ({relation} descriptor)")
         off = 9
         while off + 2 <= len(data):
             length = data[off]
@@ -477,12 +528,22 @@ def describe_descriptor(dtype: int, data: bytes) -> list[str]:
                 break
             chunk = data[off:off+length]
             if stype == 4 and length >= 9:
-                lines.append(f"offset {off}: Interface number={chunk[2]}, alternate={chunk[3]}, endpoints={chunk[4]}, class=0x{chunk[5]:02x}, subclass=0x{chunk[6]:02x}, protocol=0x{chunk[7]:02x}")
+                iface_no = chunk[2]
+                lines.append(f"offset {off}: Interface number={iface_no}, alternate={chunk[3]}, endpoints={chunk[4]}, class=0x{chunk[5]:02x}, subclass=0x{chunk[6]:02x}, protocol=0x{chunk[7]:02x}, iInterface={chunk[8]}")
+                if iface_no >= data[4]:
+                    lines.append(f"INVALID: bInterfaceNumber={iface_no} is outside bNumInterfaces={data[4]} (valid interface numbers normally 0..{max(0, data[4]-1)})")
+            elif stype == 4:
+                lines.append(f"INVALID: Interface descriptor at offset {off} has bLength={length}; USB Interface descriptor requires 9 bytes")
+                if length >= 3:
+                    lines.append(f"partial Interface fields: bInterfaceNumber={chunk[2]}")
             elif stype == 5 and length >= 7:
                 packet = chunk[4] | chunk[5] << 8
                 lines.append(f"offset {off}: Endpoint address=0x{chunk[2]:02x}, attributes=0x{chunk[3]:02x}, max_packet={packet}, interval={chunk[6]}")
             elif stype == 0x21 and length >= 6:
                 lines.append(f"offset {off}: HID bcdHID=0x{(chunk[2] | chunk[3]<<8):04x}, country={chunk[4]}, subordinate_count={chunk[5]}")
+                expected_hid_len = 6 + 3 * chunk[5]
+                if length != expected_hid_len:
+                    lines.append(f"INVALID: HID descriptor bLength={length}, expected {expected_hid_len} for bNumDescriptors={chunk[5]}")
             else:
                 lines.append(f"offset {off}: subdescriptor type=0x{stype:02x}, len={length}")
             off += length
@@ -1069,6 +1130,20 @@ def configuration_comparison_html(data: dict[str, Any]) -> str:
     return header + f'<p>USBPcap восстановил {data.get("observed_descriptor_count", 0)} типов/вариантов дескрипторов; не запрошено: {data.get("not_requested_count", 0)}; частично/без payload: {data.get("partial_count", 0)}; отличий: {data.get("different_count", 0)}.</p>' + ''.join(rows)
 
 
+def setup_packet_hex(request: dict[str, Any] | None) -> str | None:
+    """USB SETUP packet as transmitted: bmRequestType, bRequest, then LE words."""
+    if not isinstance(request, dict):
+        return None
+    try:
+        values = [int(request[k]) for k in ("bmRequestType", "bRequest", "wValue", "wIndex", "wLength")]
+        bm, br, wv, wi, wl = values
+        if not (0 <= bm <= 255 and 0 <= br <= 255 and all(0 <= x <= 0xffff for x in (wv, wi, wl))):
+            return None
+        return bytes((bm, br, wv & 255, wv >> 8, wi & 255, wi >> 8, wl & 255, wl >> 8)).hex()
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def build_host_capture_inventory(host_groups: list[dict[str, Any]]) -> dict[str, Any]:
     """Reconstruct USB enumeration from the complete PCAP, independent of fuzz-case windows.
 
@@ -1091,7 +1166,8 @@ def build_host_capture_inventory(host_groups: list[dict[str, Any]]) -> dict[str,
                  "bus_id": g.get("bus_id"), "device_address": g.get("device_address"),
                  "urb_id": g.get("urb_id"), "urb_status": g.get("status"),
                  "complete_seen": g.get("complete_seen", False),
-                 "setup": {"bmRequestType": bm, "bRequest": br, "wValue": wv, "wIndex": wi, "wLength": wl},
+                  "setup": {"bmRequestType": bm, "bRequest": br, "wValue": wv, "wIndex": wi, "wLength": wl},
+                 "setup_hex": setup_packet_hex(req),
                  "payload_hex": g.get("payload").hex() if g.get("payload") is not None else None}
         control_events.append(event)
         if br == 6 and (bm & 0x80):
@@ -1132,11 +1208,14 @@ def host_inventory_html(inventory: dict[str, Any]) -> str:
     for dev in inventory.get("devices",[]):
         ids=dev.get("vid_pid",{})
         out.append(f'<h3>USB bus {html.escape(str(dev.get("bus_id")))} / address {html.escape(str(dev.get("device_address")))} — VID {html.escape(str(ids.get("vid") or "unknown"))} PID {html.escape(str(ids.get("pid") or "unknown"))}</h3>')
-        out.append('<table><thead><tr><th>Frame</th><th>Descriptor</th><th>Setup (bmReq, bReq, wValue, wIndex, wLength)</th><th>Status</th><th>HEX получено из USBPcap</th></tr></thead><tbody>')
+        out.append('<table><thead><tr><th>Frame</th><th>Descriptor</th><th>Setup parameters</th><th>Request HEX</th><th>Status</th><th>Requested / received</th><th>Response HEX</th></tr></thead><tbody>')
         for tx in dev.get("transactions",[]):
             q=tx["setup"]; setup=' '.join(f'{q[k]:04X}' for k in ("bmRequestType","bRequest","wValue","wIndex","wLength"))
-            hx=tx.get("actual_hex") or "NO DATA"
-            out.append(f'<tr><td>{html.escape(str(tx.get("frames")))}</td><td>{html.escape(tx["descriptor_name"])}</td><td><code>{setup}</code></td><td>{html.escape(str(tx.get("urb_status")))}</td><td><code>{html.escape(hx.upper())}</code></td></tr>')
+            hx=tx.get("actual_hex") or "NO RESPONSE DATA"
+            reqhex=tx.get("setup_hex") or "N/A"
+            requested=tx.get("requested_length")
+            actual=tx.get("actual_length")
+            out.append(f'<tr><td>{html.escape(str(tx.get("frames")))}</td><td>{html.escape(tx["descriptor_name"])}</td><td><code>{setup}</code></td><td><code>{html.escape(reqhex.upper())}</code></td><td>{html.escape(str(tx.get("urb_status")))}</td><td>{requested} / {actual if actual is not None else "—"}</td><td><code>{html.escape(hx.upper())}</code></td></tr>')
         out.append('</tbody></table>')
         for d in dev.get("descriptors",[]):
             out.append(f'<details><summary>{html.escape(d["descriptor_name"])} — {d.get("actual_length")} bytes</summary><pre>{html.escape((d.get("actual_hex") or "NO DATA").upper())}</pre><ul>'+''.join(f'<li>{html.escape(x)}</li>' for x in d.get("decoded",[]))+'</ul></details>')

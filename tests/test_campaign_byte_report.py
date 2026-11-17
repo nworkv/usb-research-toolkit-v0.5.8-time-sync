@@ -20,7 +20,7 @@ verifier_spec.loader.exec_module(verifier)
 
 FIELDS = [
     "frame.number", "frame.time_epoch", "usb.bus_id", "usb.device_address", "usb.urb_id",
-    "usb.urb_type", "usb.endpoint_address", "usb.transfer_type", "usb.urb_status",
+    "usb.irp_id", "usb.urb_function", "usb.control_stage", "usb.data_fragment", "usb.urb_type", "usb.usbd_status", "usb.endpoint_address", "usb.transfer_type", "usb.urb_status",
     "usb.bmRequestType", "usb.setup.bRequest", "usb.setup.wValue", "usb.setup.wIndex",
     "usb.setup.wLength", "usb.data_len", "usb.capdata", "usb.control.Response",
     "usb.getDescriptor.Response", "usb.idVendor", "usb.idProduct",
@@ -117,6 +117,34 @@ for r in rows:
         assert "ОТПРАВЛЕНО — RAW GADGET TRACE" in html
         assert "ПОЛУЧЕНО — WINDOWS USBPcap" in html
 
+        # End-to-end fake tshark output in native Windows USBPcap form.
+        setup_row = {f: "" for f in FIELDS}
+        setup_row.update({"frame.number": "7", "frame.time_epoch": "1001.0", "usb.bus_id": "1",
+            "usb.device_address": "1", "usb.irp_id": "0xffff8308136eba80",
+            "usb.urb_function": "URB_FUNCTION_GET_DESCRIPTOR_FROM_DEVICE (0x000b)",
+            "usb.control_stage": "0", "usb.bmRequestType": "128", "usb.setup.bRequest": "6",
+            "usb.setup.wValue": "256", "usb.setup.wIndex": "0", "usb.setup.wLength": str(len(expected))})
+        complete_row = {f: "" for f in FIELDS}
+        complete_row.update({"frame.number": "8", "frame.time_epoch": "1001.001", "usb.bus_id": "1",
+            "usb.device_address": "1", "usb.irp_id": "0xffff8308136eba80",
+            "usb.urb_function": "URB_FUNCTION_CONTROL_TRANSFER (0x0008)",
+            "usb.control_stage": "3", "usb.usbd_status": "USBD_STATUS_SUCCESS (0x00000000)",
+            "usb.data_len": str(len(expected)),
+            "usb.getDescriptor.Response": ":".join(f"{x:02x}" for x in expected)})
+        usbpcap_pcap = temp / "usbpcap.pcapng"
+        usbpcap_pcap.write_text(json.dumps([setup_row, complete_row]))
+        run = subprocess.run([sys.executable, str(SCRIPT), "--campaign-dir", str(campaign),
+                              "--host-pcap", str(usbpcap_pcap), "--tshark", str(fake_tshark),
+                              "--out-prefix", str(campaign / "usbpcap-report")],
+                             text=True, capture_output=True)
+        assert run.returncode == 0, run.stdout + "\\n" + run.stderr
+        usbpcap_report = json.loads((campaign / "usbpcap-report.json").read_text())
+        inventory = usbpcap_report["host_capture_inventory"]
+        assert inventory["get_descriptor_count"] == 1, inventory
+        tx = inventory["devices"][0]["transactions"][0]
+        assert tx["frames"] == [7, 8] and tx["actual_hex"] == expected.hex(), tx
+        assert tx["setup_hex"] == "800600010000" + f"{len(expected):04x}"[-2:] + "00"
+
         bad_bytes = bytearray(expected)
         bad_bytes[8] ^= 0x01
         bad_pcap = temp / "bad.pcapng"
@@ -155,6 +183,27 @@ for r in rows:
         device_bad = json.loads((campaign / "device-mismatch-report.json").read_text())
         assert device_bad["cases"][0]["verdict"] == "DEVICE_TRACE_BYTES_MISMATCH_PROFILE"
         assert device_bad["cases"][0]["descriptor_transactions"][0]["three_way_status"] == "DEVICE_TRACE_BYTES_MISMATCH_PROFILE"
+    # USBPcap uses IRP ID + URB Function + Control transfer stage, not usb.urb_type.
+    setup = {"bmRequestType": 128, "bRequest": 6, "wValue": 0x0100, "wIndex": 0, "wLength": 18}
+    usbpcap_rows = [
+        {"frame_number": 7, "time_epoch": 2000.0, "bus_id": 1, "device_address": 1,
+         "irp_id": "0xffff8308136eba80", "urb_function": "URB_FUNCTION_GET_DESCRIPTOR_FROM_DEVICE (0x000b)",
+         "control_stage": "0", "request": setup, "urb_status": "USBD_STATUS_SUCCESS (0x00000000)",
+         "get_descriptor_response": None, "control_response": None, "data_fragment": None, "capdata": None},
+        {"frame_number": 8, "time_epoch": 2000.001, "bus_id": 1, "device_address": 1,
+         "irp_id": "0xffff8308136eba80", "urb_function": "URB_FUNCTION_CONTROL_TRANSFER (0x0008)",
+         "control_stage": "3", "request": None, "urb_status": "USBD_STATUS_SUCCESS (0x00000000)",
+         "get_descriptor_response": "12:01:00:02:00:00:00:40:09:12:00:12:00:01:01:02:03:01",
+         "control_response": None, "data_fragment": None, "capdata": None},
+    ]
+    usbpcap_groups = reporter.build_transfer_groups(usbpcap_rows)
+    assert len(usbpcap_groups) == 1, usbpcap_groups
+    assert usbpcap_groups[0]["frame_numbers"] == [7, 8]
+    assert usbpcap_groups[0]["complete_seen"] is True
+    assert usbpcap_groups[0]["status"] == "COMPLETED"
+    assert usbpcap_groups[0]["payload"].hex() == "120100020000004009120012000101020301"
+    assert reporter.setup_packet_hex(setup) == "8006000100001200"
+
     print("test_campaign_byte_report: PASS")
 
 
