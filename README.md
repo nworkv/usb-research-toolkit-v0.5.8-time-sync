@@ -590,7 +590,7 @@ VID/PID в шаблонах — учебные значения. Использ�
 2. **Записал Raw Gadget** — payload, который backend передал в `EP0_WRITE`/`EP_WRITE` либо прочитал через `EP0_READ`/`EP_READ` и записал в device trace. Это программная фиксация ioctl, не измерение электрической шины.
 3. **Наблюдал Windows USBPcap** — данные ответа/передачи, извлечённые TShark из одного общего PCAPNG.
 
-Генерируются `protocol-report.html` (три панели: expected / Raw Gadget / USBPcap), `protocol-report.txt` (HEX по offset с тремя колонками) и `protocol-report.json`.
+Генерируются `protocol-report.html`, `protocol-report.txt` и `protocol-report.json`. Помимо трёхстороннего сравнения отдельных транзакций отчёт строит инвентарь полной ожидаемой конфигурации и максимально полной конфигурации, фактически наблюдавшейся в USBPcap.
 
 ```bash
 python3 scripts/report-usb-campaign.py \
@@ -601,9 +601,9 @@ python3 scripts/report-usb-campaign.py \
 
 Фактические имена каталогов и PCAPNG нужно заменить своими. По умолчанию отчёты сохраняются в каталоге кампании:
 
-- `protocol-report.html` — каждый GET_DESCRIPTOR показывает ожидаемые HEX-байты профиля, payload из Raw Gadget trace и байты USBPcap в трёх колонках; отличия подсвечиваются;
+- `protocol-report.html` — показывает ожидаемое дерево дескрипторов и максимально восстановленный инвентарь ответов USBPcap, VID/PID отдельно, текстовую расшифровку и HEX обеих сторон; добавленные на стороне хоста элементы подсвечиваются зелёным, ожидаемые, но не запрошенные — красным, отличающиеся/неполные — янтарным. Отдельно остаётся трёхстороннее сравнение Expected / Raw Gadget / USBPcap;
 - `protocol-report.txt` — те же данные в текстовом виде, включая таблицу `offset | expected | Raw Gadget | USBPcap | verdict`;
-- `protocol-report.json` — статусы, кадры, временные окна и детали сравнения для автоматической обработки.
+- `protocol-report.json` — статусы, кадры, временные окна, исходные HEX и объект `configuration_comparison` с `expected_ids`, `host_ids`, списком `entries`, декодированными полями, длинами и наблюдениями каждого дескриптора.
 
 Откройте HTML в браузере:
 
@@ -616,6 +616,11 @@ xdg-open runs/fuzz/hid-campaign-YYYYMMDD-HHMMSS/protocol-report.html
 ```bash
 less runs/fuzz/hid-campaign-YYYYMMDD-HHMMSS/protocol-report.txt
 ```
+
+
+В разделе **«Полная конфигурация: EXPECTED ↔ максимально восстановленная USBPcap»** отчёт использует все ответы `GET_DESCRIPTOR`, обнаруженные в окне случая. Для повторных запросов одного дескриптора сохраняются наблюдения, а для отображения выбирается наиболее полный успешный payload. Дескрипторы, которые хост не запрашивал в данном захвате, маркируются `NOT_REQUESTED` и не считаются доказанно удалёнными из устройства. Если запрос был, но payload не извлечён, состояние будет `REQUESTED_NO_PAYLOAD`. Поле `host_configuration_descriptors` содержит захваченные Configuration Descriptor и проверку длины относительно `wTotalLength`.
+
+Важно: «максимально восстановленная» означает максимум данных, которые реально удалось извлечь из данного USBPcap, а не гарантированно исчерпывающий перечень всех дескрипторов устройства. USBPcap не может показать дескриптор, который Windows не запросила или который не попал в захват.
 
 Скрипт берёт ожидаемые байты из **точного `case-NNNNN.json` данного запуска**, а не из исходного шаблона, поэтому учитывает фактические мутации. Он связывает PCAP кадры со случаем по `started_epoch`/`ended_epoch` из `campaign.jsonl` и времени `frame.time_epoch` из TShark. Часы Windows и Pi должны быть синхронизированы. По умолчанию задан допуск 0,75 секунды у краёв каждого временного окна. Если Windows clock опережает Pi на 2 секунды, вычтите такую разницу из timestamp хоста:
 
@@ -648,6 +653,7 @@ python3 scripts/report-usb-campaign.py \
 
 ```bash
 python3 tests/test_campaign_byte_report.py scripts/report-usb-campaign.py
+python3 tests/test_usb_configuration_reconstruction.py
 ```
 
 Тест использует имитированный TShark, поэтому проверяет формирование отчётов и обнаружение byte mismatch, но не заменяет анализ реального захвата.

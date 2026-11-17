@@ -968,6 +968,106 @@ def correlate_data_transfers(trace_transfers: list[dict[str, Any]], host_groups:
     return result
 
 
+
+def descriptor_key_from_transaction(t: dict[str, Any]) -> tuple[int, int, int, int | None]:
+    return (int(t.get("descriptor_type", -1)), int(t.get("descriptor_index", 0)),
+            int(t.get("language_id", 0)), t.get("interface"))
+
+def decode_device_ids(data: bytes | None) -> dict[str, str | None]:
+    if not data or len(data) < 12 or data[1] != 1:
+        return {"vid": None, "pid": None}
+    return {"vid": f"0x{data[8] | data[9] << 8:04X}",
+            "pid": f"0x{data[10] | data[11] << 8:04X}"}
+
+def reconstruct_host_configuration(transactions: list[dict[str, Any]], expected_catalogue: list[dict[str, Any]]) -> dict[str, Any]:
+    """Reconstruct the richest descriptor inventory actually observed in USBPcap.
+
+    This is deliberately an observed-data inventory, not an assertion that unrequested
+    descriptors do not exist. Repeated short/long reads are retained as observations;
+    the longest successful payload is selected as the best available representation.
+    """
+    observations: dict[tuple[int, int, int, int | None], list[dict[str, Any]]] = defaultdict(list)
+    for t in transactions:
+        key = descriptor_key_from_transaction(t)
+        raw_hex = t.get("actual_hex")
+        raw = bytes.fromhex(raw_hex) if raw_hex else None
+        observations[key].append({"raw": raw, "frames": t.get("frames", []),
+                                  "status": t.get("host_transfer_status"),
+                                  "requested_length": (t.get("request") or {}).get("wLength"),
+                                  "result": t.get("result")})
+    host_map: dict[tuple[int, int, int, int | None], bytes] = {}
+    for key, items in observations.items():
+        usable = [x for x in items if x["raw"] is not None]
+        if usable:
+            # Prefer complete/successful reads, then the longest payload, then latest observation.
+            usable.sort(key=lambda x: (x["status"] in ("COMPLETED", "COMPLETION_FRAME_OBSERVED", "SUCCESS", "0", None), len(x["raw"]), len(x["frames"])), reverse=True)
+            host_map[key] = usable[0]["raw"]
+    expected_map: dict[tuple[int, int, int, int | None], bytes] = {}
+    for item in expected_catalogue:
+        try:
+            key = (int(item["type"]), int(item["index"]), int(item.get("language_id") or 0), item.get("interface"))
+            expected_map[key] = bytes.fromhex(item["expected_hex"])
+        except Exception:
+            continue
+    all_keys = sorted(set(expected_map) | set(host_map), key=lambda k: (k[0], k[1], k[2], -1 if k[3] is None else k[3]))
+    entries = []
+    for key in all_keys:
+        dtype, index, lang, iface = key
+        exp, got = expected_map.get(key), host_map.get(key)
+        if exp is None:
+            state, result = "HOST_ONLY", "ADDED_ON_HOST"
+        elif got is None:
+            state, result = ("NOT_REQUESTED", "NOT_OBSERVED") if key not in observations else ("REQUESTED_NO_PAYLOAD", "INCOMPLETE")
+        elif len(exp) == len(got) and exp == got:
+            state, result = "RECEIVED", "IDENTICAL"
+        elif len(got) < len(exp):
+            state, result = "PARTIAL_RECEIVED", "DIFFERENT_OR_TRUNCATED"
+        else:
+            state, result = "RECEIVED", "DIFFERENT"
+        entries.append({"key": list(key), "name": descriptor_name(dtype, index, lang, iface),
+                        "type": dtype, "index": index, "language_id": lang, "interface": iface,
+                        "state": state, "result": result, "expected_hex": exp.hex() if exp is not None else None,
+                        "host_hex": got.hex() if got is not None else None,
+                        "expected_length": len(exp) if exp is not None else None,
+                        "host_length": len(got) if got is not None else None,
+                        "expected_decoded": describe_descriptor(dtype, exp) if exp is not None else [],
+                        "host_decoded": describe_descriptor(dtype, got) if got is not None else [],
+                        "host_observations": [{"frames": x["frames"], "status": x["status"],
+                                               "requested_length": x["requested_length"],
+                                               "payload_length": len(x["raw"]) if x["raw"] is not None else None}
+                                              for x in observations.get(key, [])]})
+    expected_device = expected_map.get((1, 0, 0, None))
+    host_device = host_map.get((1, 0, 0, None))
+    exp_ids, host_ids = decode_device_ids(expected_device), decode_device_ids(host_device)
+    host_configurations = []
+    for key, raw in host_map.items():
+        if key[0] == 2:
+            host_configurations.append({"index": key[1], "length": len(raw), "hex": raw.hex(),
+                                        "decoded": describe_descriptor(2, raw),
+                                        "complete_by_wTotalLength": len(raw) >= (raw[2] | raw[3] << 8) if len(raw) >= 4 else False})
+    return {"status": "OBSERVED" if host_map else "NOT_OBSERVED",
+            "expected_ids": exp_ids, "host_ids": host_ids, "entries": entries,
+            "host_configuration_descriptors": host_configurations,
+            "observed_descriptor_count": len(host_map),
+            "not_requested_count": sum(x["state"] == "NOT_REQUESTED" for x in entries),
+            "partial_count": sum(x["state"] in ("PARTIAL_RECEIVED", "REQUESTED_NO_PAYLOAD") for x in entries),
+            "different_count": sum(x["result"] in ("DIFFERENT", "DIFFERENT_OR_TRUNCATED", "ADDED_ON_HOST") for x in entries)}
+
+def configuration_comparison_html(data: dict[str, Any]) -> str:
+    entries = data.get("entries", [])
+    rows = []
+    for item in entries:
+        state = item["state"]
+        cls = "added" if state == "HOST_ONLY" else ("unobserved" if state == "NOT_REQUESTED" else ("changed" if item["result"] not in ("IDENTICAL", "NOT_OBSERVED") else "same"))
+        def pane(label: str, raw_hex: str | None, decoded: list[str]) -> str:
+            dump = " ".join(raw_hex[i:i+2].upper() for i in range(0, len(raw_hex), 2)) if raw_hex else "Нет полученных данных"
+            return f'<div><b>{label}</b><pre>{html.escape(dump)}</pre><ul>' + ''.join(f'<li>{html.escape(x)}</li>' for x in decoded) + '</ul></div>'
+        rows.append(f'<article class="descriptor-row {cls}"><h4>{html.escape(item["name"])} — {html.escape(item["result"])}</h4><div class="descriptor-pair">{pane("EXPECTED / PROFILE", item.get("expected_hex"), item.get("expected_decoded", []))}{pane("HOST RECEIVED / USBPcap", item.get("host_hex"), item.get("host_decoded", []))}</div><p class="muted">Состояние: {html.escape(state)}; длина expected={item.get("expected_length")}; host={item.get("host_length")}; наблюдения={html.escape(json.dumps(item.get("host_observations", []), ensure_ascii=False))}</p></article>')
+    ids = data.get("expected_ids", {})
+    host_ids = data.get("host_ids", {})
+    header = f'<div class="id-grid"><div><b>EXPECTED VID/PID</b><p>VID {html.escape(str(ids.get("vid") or "N/A"))} · PID {html.escape(str(ids.get("pid") or "N/A"))}</p></div><div><b>HOST RECEIVED VID/PID</b><p>VID {html.escape(str(host_ids.get("vid") or "NOT RECEIVED"))} · PID {html.escape(str(host_ids.get("pid") or "NOT RECEIVED"))}</p></div></div>'
+    return header + f'<p>USBPcap восстановил {data.get("observed_descriptor_count", 0)} типов/вариантов дескрипторов; не запрошено: {data.get("not_requested_count", 0)}; частично/без payload: {data.get("partial_count", 0)}; отличий: {data.get("different_count", 0)}.</p>' + ''.join(rows)
+
 def render_case(row: dict[str, Any], profile_path: Path, trace_path: Path | None,
                 profile: dict[str, Any] | None, device_events: list[dict[str, Any]],
                 host_groups: list[dict[str, Any]], verifier: Any,
@@ -1164,6 +1264,7 @@ def render_case(row: dict[str, Any], profile_path: Path, trace_path: Path | None
         "device_trace_payload_transfers": trace_payload_transfers,
         "correlated_data_transfers": correlated_data_transfers,
         "expected_descriptor_catalogue": catalogue_display,
+        "configuration_comparison": reconstruct_host_configuration(descriptor_transactions, catalogue_display),
         "non_control_payload_transfers": data_transfers,
         "note": "PCAP/USBPcap shows host-stack observations. A single campaign PCAP is partitioned by timestamps; synchronize clocks and review ambiguous frames. USBPcap is not an electrical USB analyzer."
     }
@@ -1252,6 +1353,16 @@ def build_txt(report: dict[str, Any]) -> str:
                 lines.append(f"  {item['name']}: {item['expected_hex']} (NOT_OBSERVED_IN_PCAP; это не доказывает, что хост не запрашивал его вне окна/захвата)")
         else:
             lines.append("  все каталогизированные ключи дескрипторов наблюдались (не обязательно все байты сравнивались)")
+        comparison = case.get("configuration_comparison", {})
+        lines.extend(["", "ПОЛНОЕ ВОССТАНОВЛЕНИЕ КОНФИГУРАЦИИ ПО USBPcap (только наблюдавшиеся данные):",
+                      f"  EXPECTED VID={comparison.get('expected_ids', {}).get('vid')} PID={comparison.get('expected_ids', {}).get('pid')}",
+                      f"  HOST VID={comparison.get('host_ids', {}).get('vid')} PID={comparison.get('host_ids', {}).get('pid')}"])
+        for item in comparison.get("entries", []):
+            lines.extend([f"  {item['name']} | {item['result']} | state={item['state']}",
+                          f"    EXPECTED HEX: {item.get('expected_hex') or '<нет в профиле>'}",
+                          f"    HOST HEX:     {item.get('host_hex') or '<не получено>'}"])
+            lines.extend("    EXPECTED: " + x for x in item.get("expected_decoded", []))
+            lines.extend("    HOST: " + x for x in item.get("host_decoded", []))
         if case.get("host_errors"):
             lines.extend(["", "ОШИБОЧНЫЕ HOST TRANSFERS:"])
             lines.extend(f"  frames={e.get('frames')} status={e.get('status')} request={e.get('request')}" for e in case["host_errors"])
@@ -1326,6 +1437,7 @@ def build_html(report: dict[str, Any]) -> str:
 <summary><span class="case-title">CASE {case['case']:05d}</span><span class="pill {case_class}">{html.escape(case['verdict'])}</span><span class="muted">run={html.escape(case['run_status'])}; host groups={case['host_groups_in_window']}</span></summary>
 <div class="meta"><p><b>Профиль:</b> {html.escape(case['profile'])}</p><p><b>SHA-256:</b> <code>{html.escape(str(case.get('profile_sha256')))}</code></p><p><b>Trace:</b> {html.escape(str(case.get('trace')))}</p><p><b>События на Pi:</b> control requests={events['control_request_count']}, completed EP0={events['control_response_complete_count']}, CONFIGURED={events['configured_observed']}, STALL={events['stall_count']}, reset={events['reset_count']}, disconnect={events['disconnect_count']}, errors={events['error_count']}</p><p><b>Проверка байтов:</b> {html.escape(str(case.get('byte_correlation_status')))}</p>{''.join('<p class="missing">'+html.escape(str(w))+'</p>' for w in case.get('warnings', []))}</div>
 <h3>Что изменено в этом профиле</h3><ul>{changes}</ul>
+<h3>Полная конфигурация: EXPECTED ↔ максимально восстановленная USBPcap</h3>{configuration_comparison_html(case.get("configuration_comparison", {}))}
 <h3>Что Raw Gadget записал в trace</h3><ul>{''.join(f'<li>{html.escape(str(x["name"]))}: trace={html.escape(str(x.get("result")))}, request seq={html.escape(str(x.get("request_sequence")))}, response seq={html.escape(str(x.get("response_sequence")))}, байт={html.escape(str(x.get("trace_length")))} / expected={html.escape(str(x.get("expected_length")))}</li>' for x in case.get("device_trace_descriptor_transactions", [])) or '<li>Нет завершённых ответов GET_DESCRIPTOR в trace.</li>'}</ul>
 <h3>События SET_CONFIGURATION в хостовом захвате</h3><ul>{setcfg}</ul>
 <h3>Побайтовая проверка дескрипторов: профиль → Raw Gadget → USBPcap</h3>{descriptor_parts}
@@ -1336,7 +1448,7 @@ def build_html(report: dict[str, Any]) -> str:
     return f'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>USB campaign byte report</title>
 <style>
 :root{{color-scheme:light dark;--border:#7d8790;--bg:#12171c;--panel:#1c242c;--text:#e8edf2;--muted:#aeb8c2;--ok:#214d38;--bad:#6c252a;--warn:#5d4a1f;--byte:#313b45}}
-body{{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;background:var(--bg);color:var(--text);margin:0;padding:22px;line-height:1.42}}h1,h2,h3,h4,h5{{font-family:system-ui,sans-serif}}h1{{margin:0 0 6px}}h2{{margin-top:26px}}.meta,.muted{{color:var(--muted);overflow-wrap:anywhere}}.summary{{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0}}.summarybox{{border:1px solid var(--border);border-radius:8px;padding:10px;min-width:130px;display:flex;flex-direction:column;gap:5px}}.summarybox b{{font-size:22px}}.case{{border:1px solid var(--border);border-radius:10px;margin:14px 0;padding:12px;background:var(--panel)}}summary{{cursor:pointer;display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:4px}}.case-title{{font-size:18px;font-weight:bold}}.pill{{padding:3px 8px;border-radius:5px;font-size:12px;overflow-wrap:anywhere}}.pill.match,.pill.good{{background:var(--ok)}}.pill.mismatch,.pill.bad{{background:var(--bad)}}.pill.warn{{background:var(--warn)}}.comparegrid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:10px 0}}.pane{{min-width:0;border:1px solid var(--border);border-radius:8px;padding:10px}}.pane h4{{margin:0 0 10px}}.expected{{border-top:4px solid #3f9a64}}.observed{{border-top:4px solid #c18d41}}.sent{{border-top:4px solid #5288bd}}.hexdump{{overflow-x:auto;background:#0e1216;padding:8px;border-radius:5px}}.hexrow{{display:flex;gap:8px;white-space:nowrap}}.offset{{color:#8da0b3;min-width:42px}}.ascii{{color:#93a5b7;margin-left:8px}}.byte{{display:inline-block;padding:1px 2px;border-radius:2px;margin-right:1px;background:var(--byte)}}.byte.bad{{background:#a72f39;color:#fff;font-weight:bold}}.byte.good{{background:#254633}}.missing{{color:#ffbd8f;border:1px solid #9a653d;padding:10px;border-radius:5px}}.decoded{{margin-top:7px;padding-left:20px;overflow-wrap:anywhere}}.diffline{{margin:10px 0;padding:8px;background:#0e1216;border-radius:5px}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;background:#0e1216;padding:10px;border-radius:5px}}.note{{border-left:4px solid #c18d41;padding:10px;margin:12px 0}}@media(max-width:850px){{.comparegrid{{grid-template-columns:1fr}}}}
+body{{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;background:var(--bg);color:var(--text);margin:0;padding:22px;line-height:1.42}}h1,h2,h3,h4,h5{{font-family:system-ui,sans-serif}}h1{{margin:0 0 6px}}h2{{margin-top:26px}}.meta,.muted{{color:var(--muted);overflow-wrap:anywhere}}.summary{{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0}}.summarybox{{border:1px solid var(--border);border-radius:8px;padding:10px;min-width:130px;display:flex;flex-direction:column;gap:5px}}.summarybox b{{font-size:22px}}.case{{border:1px solid var(--border);border-radius:10px;margin:14px 0;padding:12px;background:var(--panel)}}summary{{cursor:pointer;display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:4px}}.case-title{{font-size:18px;font-weight:bold}}.pill{{padding:3px 8px;border-radius:5px;font-size:12px;overflow-wrap:anywhere}}.pill.match,.pill.good{{background:var(--ok)}}.pill.mismatch,.pill.bad{{background:var(--bad)}}.pill.warn{{background:var(--warn)}}.comparegrid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:10px 0}}.pane{{min-width:0;border:1px solid var(--border);border-radius:8px;padding:10px}}.pane h4{{margin:0 0 10px}}.expected{{border-top:4px solid #3f9a64}}.observed{{border-top:4px solid #c18d41}}.sent{{border-top:4px solid #5288bd}}.hexdump{{overflow-x:auto;background:#0e1216;padding:8px;border-radius:5px}}.hexrow{{display:flex;gap:8px;white-space:nowrap}}.offset{{color:#8da0b3;min-width:42px}}.ascii{{color:#93a5b7;margin-left:8px}}.byte{{display:inline-block;padding:1px 2px;border-radius:2px;margin-right:1px;background:var(--byte)}}.byte.bad{{background:#a72f39;color:#fff;font-weight:bold}}.byte.good{{background:#254633}}.missing{{color:#ffbd8f;border:1px solid #9a653d;padding:10px;border-radius:5px}}.descriptor-row{{border:1px solid var(--border);border-left:5px solid #777;border-radius:7px;padding:10px;margin:9px 0}}.descriptor-row.added{{border-left-color:#27ae60;background:#123322}}.descriptor-row.unobserved{{border-left-color:#77818a;background:#242a30}}.descriptor-row.changed{{border-left-color:#d69e36;background:#332b18}}.descriptor-row.same{{border-left-color:#568c6b}}.descriptor-pair,.id-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}}.descriptor-pair pre{{overflow-wrap:anywhere}}.decoded{{margin-top:7px;padding-left:20px;overflow-wrap:anywhere}}.diffline{{margin:10px 0;padding:8px;background:#0e1216;border-radius:5px}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;background:#0e1216;padding:10px;border-radius:5px}}.note{{border-left:4px solid #c18d41;padding:10px;margin:12px 0}}@media(max-width:850px){{.comparegrid{{grid-template-columns:1fr}}}}
 </style></head><body>
 <h1>USB Research Toolkit — побайтовый отчёт кампании</h1><p class="meta">Кампания: {html.escape(report['campaign_dir'])}<br>PCAPNG: {html.escape(report['host_pcap'])}<br>Generated: {html.escape(report['created_utc'])}</p>
 <div class="note">Три источника: ожидаемые байты JSON-профиля; payload, записанный Raw Gadget при EP0_WRITE/endpoint I/O; данные, извлечённые TShark из USBPcap. Это наблюдение на уровне host stack, не подтверждение электрических USB-пакетов. Обработка привязана ко времени записи кампании; при несинхронизированных часах сопоставление может быть неверным.</div>

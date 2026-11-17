@@ -1,0 +1,52 @@
+#!/usr/bin/env python3
+"""Unit tests for maximal USBPcap descriptor inventory reconstruction."""
+import importlib.util
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SPEC = importlib.util.spec_from_file_location("usb_report_reconstruction", ROOT / "scripts/report-usb-campaign.py")
+REPORTER = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(REPORTER)
+
+
+def main():
+    # Device descriptor, a complete 9-byte configuration header and one HID report descriptor.
+    device = bytes.fromhex("12 01 00 02 00 00 00 40 34 12 78 56 00 01 01 02 03 01")
+    config = bytes.fromhex("09 02 09 00 00 01 00 80 32")
+    hid_report = bytes.fromhex("05 01 09 06 A1 01 C0")
+    catalogue = [
+        {"type": 1, "index": 0, "language_id": 0, "interface": None,
+         "name": "Device", "expected_hex": device.hex()},
+        {"type": 2, "index": 0, "language_id": 0, "interface": None,
+         "name": "Configuration", "expected_hex": config.hex()},
+        {"type": 34, "index": 0, "language_id": 0, "interface": 0,
+         "name": "HID Report", "expected_hex": hid_report.hex()},
+        {"type": 3, "index": 2, "language_id": 0x0409, "interface": None,
+         "name": "Product String", "expected_hex": "".encode().hex()},
+    ]
+    def tx(dtype, index, payload, interface=None, lang=0, frames=None, req_len=None):
+        return {"descriptor_type": dtype, "descriptor_index": index, "language_id": lang,
+                "interface": interface, "actual_hex": payload.hex(), "frames": frames or [1],
+                "host_transfer_status": "COMPLETED", "request": {"wLength": req_len or len(payload)},
+                "result": "MATCH"}
+    transactions = [tx(1, 0, device), tx(2, 0, config), tx(34, 0, hid_report, interface=0)]
+    result = REPORTER.reconstruct_host_configuration(transactions, catalogue)
+    assert result["host_ids"] == {"vid": "0x1234", "pid": "0x5678"}
+    by_type = {tuple(x["key"]): x for x in result["entries"]}
+    assert by_type[(1, 0, 0, None)]["result"] == "IDENTICAL"
+    assert by_type[(2, 0, 0, None)]["result"] == "IDENTICAL"
+    assert by_type[(34, 0, 0, 0)]["result"] == "IDENTICAL"
+    assert by_type[(3, 2, 0x0409, None)]["state"] == "NOT_REQUESTED"
+    html = REPORTER.configuration_comparison_html(result)
+    assert "EXPECTED VID/PID" in html and "HOST RECEIVED VID/PID" in html
+    assert "NOT_REQUESTED" in html
+    # A changed endpoint/config byte must be reported as a difference.
+    changed = bytearray(config)
+    changed[8] = 0x40
+    changed_result = REPORTER.reconstruct_host_configuration([tx(2, 0, bytes(changed))], catalogue[1:2])
+    assert changed_result["different_count"] == 1
+    print("test_usb_configuration_reconstruction: PASS")
+
+
+if __name__ == "__main__":
+    main()
